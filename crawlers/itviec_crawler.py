@@ -36,11 +36,17 @@ Requirements:
 
 import json
 import time
+import sys
 import random
 import logging
 import argparse
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+
+# Add project root to sys.path for cross-module imports
+PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 from playwright.sync_api import sync_playwright, Page, Browser
 from playwright.sync_api import TimeoutError as PlaywrightTimeout
@@ -334,9 +340,37 @@ def extract_job_detail(page: Page, slug: str):
 
 
 def crawl(
-    max_pages: int = 3, output_path: str = "itviec_jobs.json", cdp_url: str = CDP_URL
+    max_pages: int = 3,
+    output_path: str = "itviec_jobs.json",
+    cdp_url: str = CDP_URL,
+    kafka_enabled: bool = True,
+    kafka_broker: str = "localhost:29092",
 ):
+    """
+    Main crawl function.
+    Crawl ITviec job listings and optionally push each job to Kafka.
+
+    Args:
+        max_pages: Number of list pages to crawl.
+        output_path: Path to save the output JSON file.
+        cdp_url: Chrome CDP URL for browser connection.
+        kafka_enabled: Whether to send jobs to Kafka.
+        kafka_broker: Kafka bootstrap server address.
+    """
     all_jobs = []
+    producer = None
+
+    # Initialize Kafka Producer if enabled
+    if kafka_enabled:
+        try:
+            from kafka.kafka_producer import JobMarketKafkaProducer
+            producer = JobMarketKafkaProducer(bootstrap_servers=kafka_broker)
+            if producer.producer is None:
+                log.warning("Kafka Producer failed to connect. Jobs will only be saved to file.")
+                producer = None
+        except ImportError:
+            log.warning("kafka-python not installed. Jobs will only be saved to file.")
+            producer = None
 
     with sync_playwright() as p:
         # Connect vào Chrome thật — không launch browser mới
@@ -364,6 +398,14 @@ def crawl(
                 if job:
                     all_jobs.append(job)
                     log.info(f"    ✓ {job['title']} @ {job['company']}")
+
+                    # Push to Kafka immediately after extraction
+                    if producer:
+                        if producer.send_job(job):
+                            log.info(f"    📤 Sent to Kafka: '{job['title']}' ({job['source']})")
+                        else:
+                            log.warning(f"    ⚠ Failed to send to Kafka: '{job['title']}'")
+
                 random_delay()
 
             log.info(f"Page {page_num} complete — total: {len(all_jobs)} jobs")
@@ -373,6 +415,12 @@ def crawl(
 
         # KHÔNG gọi browser.close() — Chrome thật vẫn tiếp tục chạy
         log.info("Crawler done — Chrome vẫn đang chạy bình thường")
+
+    # Flush and close Kafka Producer
+    if producer:
+        producer.flush()
+        producer.close()
+        log.info(f"Kafka: all {len(all_jobs)} jobs flushed to topic 'raw_jobs'")
 
     # Dedup theo URL
     seen, unique_jobs = set(), []
@@ -407,6 +455,21 @@ if __name__ == "__main__":
         default=CDP_URL,
         help=f"Chrome CDP URL (default: {CDP_URL})",
     )
+    parser.add_argument(
+        "--no-kafka", action="store_true", help="Disable Kafka ingestion"
+    )
+    parser.add_argument(
+        "--kafka-broker",
+        type=str,
+        default="localhost:29092",
+        help="Kafka bootstrap server (default: localhost:29092)",
+    )
     args = parser.parse_args()
 
-    crawl(max_pages=args.pages, output_path=args.output, cdp_url=args.cdp_url)
+    crawl(
+        max_pages=args.pages,
+        output_path=args.output,
+        cdp_url=args.cdp_url,
+        kafka_enabled=not args.no_kafka,
+        kafka_broker=args.kafka_broker,
+    )
