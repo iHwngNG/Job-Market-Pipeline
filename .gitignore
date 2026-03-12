@@ -161,3 +161,9 @@ airflow/logs/
 airflow/plugins/
 airflow/config/
 airflow/*.db
+
+# Specific folder
+docs/
+
+# Specific file
+*.json
