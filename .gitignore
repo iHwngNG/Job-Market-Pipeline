@@ -167,3 +167,6 @@ docs/
 
 # Specific file
 *.json
+error_debugging_logs.md
+logs.md
+PRD_VN_Job_Market_Pipeline.md

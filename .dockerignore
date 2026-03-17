@@ -1,0 +1,39 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+venv/
+.venv/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Docker (avoid nested builds)
+docker-compose.yml
+Dockerfile.*
+
+# Docs & CI (not needed in image)
+docs/
+.github/
+*.md
+!README.md
+
+# Airflow logs (generated at runtime)
+airflow/logs/
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Environment
+.env
+.env.*
+!.env.example
