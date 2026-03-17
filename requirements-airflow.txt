@@ -1,0 +1,20 @@
+# Python dependencies for Airflow workers
+# Used by: Dockerfile.airflow
+# These are pre-installed into the custom Airflow image at build time.
+
+# --- PySpark ---
+pyspark==3.5.0
+
+# --- Kafka ---
+kafka-python==2.0.2
+
+# --- Database ---
+psycopg2-binary==2.9.9
+
+# --- dbt ---
+dbt-core==1.7.0
+dbt-postgres==1.7.0
+
+# --- Crawler ---
+playwright==1.41.0
+scrapy==2.11.0

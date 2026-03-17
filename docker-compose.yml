@@ -1,28 +1,49 @@
-version: '3.8'
+# ══════════════════════════════════════════════════════════════════════════════
+# AIRFLOW SHARED CONFIG (uses pre-built custom image)
+# ══════════════════════════════════════════════════════════════════════════════
 
-x-airflow-common:
-  &airflow-common
-  image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:2.7.1}
-  environment:
-    &airflow-common-env
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: Dockerfile.airflow
+  image: jobmarket-airflow:latest
+  environment: &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/airflow
     AIRFLOW__CORE__FERNET_KEY: ''
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
     AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
-    _PIP_ADDITIONAL_DEPENDENCIES: "apache-airflow-providers-apache-spark pyspark psycopg2-binary scrapy kafka-python"
+    # Env vars for PySpark & dbt tasks inside Airflow
+    POSTGRES_HOST: postgres
+    POSTGRES_PORT: '5432'
+    POSTGRES_DB: ${POSTGRES_DB}
+    POSTGRES_USER: ${POSTGRES_USER}
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    PYSPARK_PYTHON: python3
+    PYSPARK_DRIVER_PYTHON: python3
   volumes:
     - ./airflow/dags:/opt/airflow/dags
     - ./airflow/logs:/opt/airflow/logs
     - ./airflow/plugins:/opt/airflow/plugins
-  user: "${AIRFLOW_UID:-1000:0}"
+    - ./data:/opt/airflow/data
+    # Mount project modules so DAGs can execute them
+    - ./crawlers:/opt/airflow/crawlers
+    - ./kafka_app:/opt/airflow/kafka_app
+    - ./spark_jobs:/opt/airflow/spark_jobs
+    - ./dbt:/opt/airflow/dbt
+    - ./utils:/opt/airflow/utils
   depends_on:
     postgres:
       condition: service_healthy
 
+# ══════════════════════════════════════════════════════════════════════════════
+# SERVICES
+# ══════════════════════════════════════════════════════════════════════════════
+
 services:
-  # --- DATABASE (PostgreSQL) ---
+
+  # ── DATABASE ──────────────────────────────────────────────────────────────
   postgres:
     image: postgres:15-alpine
     environment:
@@ -33,13 +54,14 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/init-airflow-db.sql:/docker-entrypoint-initdb.d/init-airflow-db.sql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER}" ]
       interval: 10s
       timeout: 5s
       retries: 5
 
-  # --- STREAMING (Kafka) ---
+  # ── STREAMING (Kafka) ────────────────────────────────────────────────────
   zookeeper:
     image: confluentinc/cp-zookeeper:7.4.0
     environment:
@@ -52,6 +74,7 @@ services:
       - zookeeper
     ports:
       - "9092:9092"
+      - "29092:29092"
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
@@ -62,6 +85,8 @@ services:
 
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
+    depends_on:
+      - kafka
     ports:
       - "8080:8080"
     environment:
@@ -69,29 +94,37 @@ services:
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
       KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
 
-  # --- ORCHESTRATION (Airflow) ---
-  airflow-webserver:
-    <<: *airflow-common
-    command: webserver
-    ports:
-      - "8081:8080"
-    healthcheck:
-      test: ["CMD-SHELL", "[ -f /opt/airflow/airflow-webserver.pid ]"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
+  kafka-init:
+    image: confluentinc/cp-kafka:7.4.0
+    depends_on:
+      - kafka
+    volumes:
+      - ./infra/kafka/init-topics.sh:/init-topics.sh
+    entrypoint: [ "/bin/bash", "/init-topics.sh" ]
+    environment:
+      KAFKA_BOOTSTRAP_SERVER: kafka:9092
+
+  # ── KAFKA CONSUMER (pre-built image, no runtime pip install) ────────────
+  kafka-consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile.consumer
+    image: jobmarket-consumer:latest
+    depends_on:
+      kafka:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER: kafka:9092
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     restart: always
 
-  airflow-scheduler:
-    <<: *airflow-common
-    command: scheduler
-    healthcheck:
-      test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
-      interval: 30s
-      timeout: 10s
-      retries: 5
-    restart: always
-
+  # ── AIRFLOW (pre-built image with Java, PySpark, dbt, Playwright) ──────
   airflow-init:
     <<: *airflow-common
     entrypoint: /bin/bash
@@ -107,37 +140,65 @@ services:
             --lastname User \
             --role Admin \
             --email admin@example.com
+        # Create Airflow connection to job_market DB for SqlSensor
+        airflow connections add postgres_job_market \
+            --conn-type postgres \
+            --conn-host postgres \
+            --conn-port 5432 \
+            --conn-login ${POSTGRES_USER} \
+            --conn-password ${POSTGRES_PASSWORD} \
+            --conn-schema ${POSTGRES_DB} || true
     environment:
       <<: *airflow-common-env
       _AIRFLOW_DB_UPGRADE: 'true'
       _AIRFLOW_WWW_USER_CREATE: 'true'
 
-  # --- PROCESSING (Spark) ---
-  spark-master:
-    image: bitnami/spark:3.4.1
-    environment:
-      - SPARK_MODE=master
-      - SPARK_RPC_AUTHENTICATION_ENABLED=no
-      - SPARK_RPC_ENCRYPTION_ENABLED=no
-      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
-      - SPARK_SSL_ENABLED=no
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
     ports:
-      - "8082:8080"
-      - "7077:7077"
+      - "8081:8080"
+    healthcheck:
+      test: [ "CMD-SHELL", "[ -f /opt/airflow/airflow-webserver.pid ]" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: always
 
-  spark-worker:
-    image: bitnami/spark:3.4.1
-    environment:
-      - SPARK_MODE=worker
-      - SPARK_MASTER_URL=spark://spark-master:7077
-      - SPARK_WORKER_CORES=1
-      - SPARK_WORKER_MEMORY=1G
-      - SPARK_RPC_AUTHENTICATION_ENABLED=no
-      - SPARK_RPC_ENCRYPTION_ENABLED=no
-      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
-      - SPARK_SSL_ENABLED=no
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: [ "CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"' ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: always
+
+  # ── DASHBOARD (pre-built Streamlit image) ───────────────────────────────
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    image: jobmarket-dashboard:latest
     depends_on:
-      - spark-master
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8501:8501"
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - ./dashboard:/app
+    restart: always
+
+# ══════════════════════════════════════════════════════════════════════════════
+# VOLUMES
+# ══════════════════════════════════════════════════════════════════════════════
 
 volumes:
   postgres_data:

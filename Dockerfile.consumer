@@ -1,0 +1,17 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# Dockerfile.consumer
+# Lightweight Python container for Kafka Consumer service.
+# Pre-installs all dependencies — no pip install at runtime.
+# ══════════════════════════════════════════════════════════════════════════════
+FROM python:3.9-slim
+
+WORKDIR /app
+
+# Install dependencies
+COPY requirements-consumer.txt /tmp/requirements-consumer.txt
+RUN pip install --no-cache-dir -r /tmp/requirements-consumer.txt
+
+# Copy consumer source code
+COPY kafka_app/ ./kafka_app/
+
+CMD ["python", "kafka_app/kafka_consumer.py"]
