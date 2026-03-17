@@ -1,4 +1,4 @@
-<img width="1272" height="825" alt="jobmarketpipeline_preview" src="https://github.com/user-attachments/assets/a0d4f419-f007-4190-9a16-9ae54e59bc10" /># Vietnam Job Market Intelligence Pipeline
+# Vietnam Job Market Intelligence Pipeline
 
 ![Apache Airflow](https://img.shields.io/badge/Apache%20Airflow-017CEE?style=for-the-badge&logo=Apache%20Airflow&logoColor=white)
 ![Apache Kafka](https://img.shields.io/badge/Apache%20Kafka-231F20?style=for-the-badge&logo=apachekafka&logoColor=white)
