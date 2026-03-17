@@ -1,0 +1,38 @@
+version: 2
+
+sources:
+  - name: public
+    description: "Tables populated by Kafka Consumer and PySpark ETL"
+    schema: public
+    tables:
+      - name: analytics_jobs
+        description: "Cleaned and standardized job listings from PySpark processing"
+        columns:
+          - name: job_id
+            description: "Unique identifier for each job posting"
+          - name: title
+            description: "Original raw job title from website"
+          - name: role
+            description: "Standardized role category (Data Engineer, Backend Developer, etc.)"
+          - name: level
+            description: "Standardized experience level (Intern, Fresher, Junior, Middle, Senior, Lead, Manager)"
+          - name: company
+            description: "Company name"
+          - name: locations
+            description: "Job location(s)"
+          - name: working_method
+            description: "Working arrangement (At office, Remote, Hybrid)"
+          - name: min_salary
+            description: "Minimum salary (numeric)"
+          - name: max_salary
+            description: "Maximum salary (numeric)"
+          - name: currency
+            description: "Salary currency (USD, VND, Unknown)"
+          - name: standardized_skills
+            description: "Array of deduplicated skill keywords"
+          - name: posted_date
+            description: "Estimated date the job was posted (YYYY-MM-DD)"
+          - name: source
+            description: "Crawl source (itviec, topcv)"
+          - name: url
+            description: "Direct URL to the job posting"

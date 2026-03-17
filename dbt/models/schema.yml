@@ -1,0 +1,73 @@
+version: 2
+
+models:
+  # ── Staging ──────────────────────────────────────────────────────────────
+  - name: stg_jobs
+    description: "Staging view with avg_salary calculated, invalid records filtered out"
+    columns:
+      - name: job_id
+        description: "Unique job identifier"
+        tests:
+          - unique
+          - not_null
+      - name: title
+        tests:
+          - not_null
+      - name: role
+        description: "Standardized role (Data Engineer, Backend Developer, etc.)"
+        tests:
+          - not_null
+      - name: level
+        description: "Standardized experience level"
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['Intern', 'Fresher', 'Junior', 'Middle', 'Senior', 'Lead', 'Manager', 'Not Specified']
+      - name: company
+        tests:
+          - not_null
+      - name: source
+        tests:
+          - accepted_values:
+              values: ['itviec', 'topcv']
+
+  # ── Marts ────────────────────────────────────────────────────────────────
+  - name: dim_skills
+    description: "Skill demand counts grouped by role and location"
+    columns:
+      - name: skill_name
+        tests:
+          - not_null
+      - name: job_count
+        tests:
+          - not_null
+
+  - name: dim_companies
+    description: "Company rankings by total open positions"
+    columns:
+      - name: company
+        tests:
+          - not_null
+          - unique
+      - name: total_jobs
+        tests:
+          - not_null
+
+  - name: fct_salary_trends
+    description: "Salary statistics by role, level, and currency"
+    columns:
+      - name: role
+        tests:
+          - not_null
+      - name: avg_salary
+        tests:
+          - not_null
+
+  - name: fct_market_overview
+    description: "High-level market KPIs and top-N breakdowns"
+    columns:
+      - name: metric_type
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['summary', 'by_role', 'by_level', 'by_location']
