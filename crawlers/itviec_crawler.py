@@ -34,12 +34,15 @@ Requirements:
     playwright install chromium
 """
 
+import os
 import json
 import time
 import sys
+import math
 import random
 import logging
 import argparse
+import concurrent.futures
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -84,15 +87,60 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ── CDP Connection ────────────────────────────────────────────────────────────
+# ── Browser Connection ────────────────────────────────────────────────────────
+
+
+def launch_browser(playwright) -> Browser:
+    """
+    Launch Playwright's built-in Chromium headless (auto-browser mode).
+    Used in Docker/CI environments where no external Chrome is available.
+    Browser will be auto-closed when the crawl finishes.
+    """
+    log.info("Launching Chromium headless (auto-browser mode)...")
+    browser = playwright.chromium.launch(
+        headless=True,
+        args=[
+            "--no-sandbox",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--window-size=1920,1080",
+        ],
+    )
+    log.info("Chromium headless launched ✓")
+    return browser
 
 
 def connect_to_chrome(playwright, cdp_url: str) -> Browser:
     """
     Connect Playwright vào Chrome thật đang chạy qua CDP.
-    Raise lỗi rõ ràng nếu Chrome chưa được mở với --remote-debugging-port.
+    Hỗ trợ kết nối xuyên Docker (host.docker.internal) bằng cách tự dò ws:// endpoint.
     """
     try:
+        import urllib.request
+        import urllib.parse
+
+        # Nếu connect từ Docker qua host.docker.internal, Chrome sẽ chặn header Host.
+        # Ta cần request bằng urllib với Host spoofing, lấy WebSocket URL thật rồi kết nối
+        if cdp_url.startswith("http"):
+            parsed = urllib.parse.urlparse(cdp_url)
+            req = urllib.request.Request(
+                f"{cdp_url}/json/version",
+                headers={"Host": "localhost:9222"},  # Đánh lừa Chrome CDP
+            )
+            with urllib.request.urlopen(req, timeout=5) as response:
+                data = json.loads(response.read().decode())
+                ws_url = data.get("webSocketDebuggerUrl")
+                if ws_url:
+                    # Ghi đè lại host.docker.internal nếu ws_url trả về 127.0.0.1 hoặc localhost
+                    if (
+                        parsed.hostname != "localhost"
+                        and parsed.hostname != "127.0.0.1"
+                    ):
+                        ws_parsed = urllib.parse.urlparse(ws_url)
+                        ws_url = ws_url.replace(ws_parsed.hostname, parsed.hostname)
+                    cdp_url = ws_url
+
         browser = playwright.chromium.connect_over_cdp(cdp_url)
         log.info(f"Connected to Chrome via CDP at {cdp_url} ✓")
         return browser
@@ -176,7 +224,7 @@ def safe_text(page: Page, selector: str, default: str = "") -> str:
         return default
 
 
-def safe_texts(page: Page, selector: str) -> list[str]:
+def safe_texts(page: Page, selector: str) -> list:
     try:
         els = page.query_selector_all(selector)
         return [el.inner_text().strip() for el in els if el.inner_text().strip()]
@@ -278,7 +326,7 @@ def load_page(page: Page, url: str, wait_time: float = 3.0) -> bool:
 # ── Phase 1: Extract slugs ────────────────────────────────────────────────────
 
 
-def get_job_slugs(page: Page) -> list[str]:
+def get_job_slugs(page: Page) -> list:
     """Extract job slugs từ div.job-card elements."""
     cards = page.query_selector_all(SEL_JOB_CARD)
     slugs = []
@@ -287,6 +335,37 @@ def get_job_slugs(page: Page) -> list[str]:
         if slug and slug.strip():
             slugs.append(slug.strip())
     return slugs
+
+
+def get_max_pages(page: Page) -> int:
+    """
+    Auto-detect total number of pages from the pagination <nav>.
+
+    ITviec pagination structure:
+        <nav>
+          <div class="page">...</div>   <!-- page 1 (current) -->
+          <div class="page">...</div>   <!-- page 2 -->
+          <div class="page">...</div>   <!-- ... (ellipsis) -->
+          <div class="page"><a href="...?page=61...">61</a></div>  <!-- last -->
+          <div class="page">...</div>   <!-- next button -->
+        </nav>
+
+    Strategy: find all <a> tags inside nav > div.page, parse their
+    text content as integers, and return the maximum value found.
+    """
+    try:
+        links = page.query_selector_all("nav div.page a")
+        max_page = 1
+        for link in links:
+            text = link.inner_text().strip()
+            if text.isdigit():
+                max_page = max(max_page, int(text))
+
+        log.info(f"Pagination detected: {max_page} total pages")
+        return max_page
+    except Exception as e:
+        log.warning(f"Could not detect max pages ({e}), defaulting to 1")
+        return 1
 
 
 # ── Phase 2: Extract detail ───────────────────────────────────────────────────
@@ -317,6 +396,7 @@ def extract_job_detail(page: Page, slug: str):
             log.warning(f"  Missing title at {slug} — selectors có thể cần update")
 
         return {
+            "job_id": f"itviec_{slug}",
             "title": title,
             "company": company,
             "salary": salary,
@@ -325,7 +405,7 @@ def extract_job_detail(page: Page, slug: str):
             "skills": skills,
             "expertise": expertise,
             "posted_date": posted_date,
-            "description": description[:2000] if description else "",
+            "description": description if description else "",
             "source": "itviec",
             "url": detail_url,
             "crawled_at": datetime.now(timezone.utc).isoformat(),
@@ -336,15 +416,93 @@ def extract_job_detail(page: Page, slug: str):
         return None
 
 
+def get_existing_job_ids() -> set:
+    """Load existing job_ids from PostgreSQL to skip already crawled jobs."""
+    db_host = os.getenv("POSTGRES_HOST", "postgres")
+    db_port = os.getenv("POSTGRES_PORT", "5432")
+    db_name = os.getenv("POSTGRES_DB", "job_market")
+    db_user = os.getenv("POSTGRES_USER", "postgres")
+    db_pass = os.getenv("POSTGRES_PASSWORD", "postgres")
+
+    existing = set()
+    try:
+        import psycopg2
+
+        conn = psycopg2.connect(
+            host=db_host, port=db_port, dbname=db_name, user=db_user, password=db_pass
+        )
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_name = 'raw_jobs'
+                );
+            """
+            )
+            if cur.fetchone()[0]:
+                cur.execute("SELECT job_id FROM raw_jobs")
+                for row in cur.fetchall():
+                    existing.add(row[0])
+        conn.close()
+        log.info(f"Loaded {len(existing)} existing job IDs from database to skip.")
+    except Exception as e:
+        log.warning(f"Could not load existing jobs from DB: {e}. Will crawl all.")
+    return existing
+
+
+def worker_crawl_chunk(
+    slugs: list, cdp_url: str, auto_browser: bool, producer=None
+) -> list:
+    """
+    Worker function to crawl a chunk of job slugs concurrently.
+    Each thread creates its own sync_playwright instance and connects to the browser.
+    """
+    jobs = []
+    with sync_playwright() as p:
+        try:
+            if auto_browser:
+                browser = launch_browser(p)
+            else:
+                browser = connect_to_chrome(p, cdp_url)
+
+            contexts = browser.contexts
+            context = contexts[0] if contexts else browser.new_context()
+
+            for slug in slugs:
+                page = context.new_page()
+                try:
+                    job = extract_job_detail(page, slug)
+                    if job:
+                        jobs.append(job)
+                        if producer:
+                            producer.send_job(job)
+                            log.info(f"    📤 Sent to Kafka (worker): '{job['title']}'")
+                except Exception as e:
+                    log.error(f"Error in worker for {slug}: {e}")
+                finally:
+                    page.close()
+                random_delay(1.0, 2.0)
+
+            if auto_browser:
+                browser.close()
+
+        except Exception as e:
+            log.error(f"Worker initialization failed: {e}")
+
+    return jobs
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 
 def crawl(
-    max_pages: int = 3,
+    max_pages: int = 0,
     output_path: str = "itviec_jobs.json",
     cdp_url: str = CDP_URL,
     kafka_enabled: bool = True,
     kafka_broker: str = "localhost:29092",
+    auto_browser: bool = False,
 ):
     """
     Main crawl function.
@@ -352,69 +510,167 @@ def crawl(
 
     Args:
         max_pages: Number of list pages to crawl.
+                   0 = auto-detect from pagination (crawl ALL pages).
+                   >0 = crawl exactly that many pages.
         output_path: Path to save the output JSON file.
         cdp_url: Chrome CDP URL for browser connection.
         kafka_enabled: Whether to send jobs to Kafka.
         kafka_broker: Kafka bootstrap server address.
+        auto_browser: If True, launch headless Chromium internally
+                      instead of connecting to external Chrome via CDP.
     """
     all_jobs = []
     producer = None
 
+    existing_job_ids = get_existing_job_ids()
+
     # Initialize Kafka Producer if enabled
     if kafka_enabled:
         try:
-            from kafka.kafka_producer import JobMarketKafkaProducer
+            from kafka_app.kafka_producer import JobMarketKafkaProducer
+
             producer = JobMarketKafkaProducer(bootstrap_servers=kafka_broker)
             if producer.producer is None:
-                log.warning("Kafka Producer failed to connect. Jobs will only be saved to file.")
+                log.warning(
+                    "Kafka Producer failed to connect. Jobs will only be saved to file."
+                )
                 producer = None
         except ImportError:
             log.warning("kafka-python not installed. Jobs will only be saved to file.")
             producer = None
 
     with sync_playwright() as p:
-        # Connect vào Chrome thật — không launch browser mới
-        browser = connect_to_chrome(p, cdp_url)
-        page = get_or_create_page(browser)
+        # Choose browser mode: auto-launch or connect to external CDP
+        if auto_browser:
+            browser = launch_browser(p)
+            page = browser.new_page()
+            log.info("Auto-browser: created new page")
+        else:
+            browser = connect_to_chrome(p, cdp_url)
+            page = get_or_create_page(browser)
 
-        for page_num in range(1, max_pages + 1):
-            list_url = LIST_URL if page_num == 1 else f"{LIST_URL}?page={page_num}"
+        # Load first page to detect total pages if auto-detect mode
+        first_url = LIST_URL
+        if not load_page(page, first_url, wait_time=3.0):
+            log.error("Cannot load first page — aborting")
+            return []
+
+        # Auto-detect total pages from pagination if max_pages <= 0
+        if max_pages <= 0:
+            max_pages = get_max_pages(page)
+            log.info(f"Auto-detect mode: will crawl all {max_pages} pages")
+        else:
+            detected = get_max_pages(page)
+            if max_pages > detected:
+                log.warning(
+                    f"Requested {max_pages} pages but only {detected} exist. "
+                    f"Capping to {detected}."
+                )
+                max_pages = detected
+            log.info(f"Manual mode: will crawl {max_pages} pages")
+
+        # Process page 1 (already loaded)
+        slugs = get_job_slugs(page)
+        log.info(f"\n[Page 1/{max_pages}] {first_url}")
+        log.info(f"Found {len(slugs)} jobs")
+
+        if slugs:
+            # Lọc bỏ các jobs đã có trong Database
+            original_len = len(slugs)
+            slugs = [slug for slug in slugs if f"itviec_{slug}" not in existing_job_ids]
+            if len(slugs) < original_len:
+                log.info(
+                    f"Skipped {original_len - len(slugs)} already crawled jobs. Remaining: {len(slugs)} jobs to extract."
+                )
+
+            if not slugs:
+                log.info("Page 1 complete — all jobs already exist.")
+            else:
+                # Chia chunks để xử lý song song (Concurrency)
+                num_workers = min(4, len(slugs))
+                chunk_size = math.ceil(len(slugs) / num_workers)
+                chunks = [
+                    slugs[i : i + chunk_size] for i in range(0, len(slugs), chunk_size)
+                ]
+                log.info(f"Processing concurrently using {len(chunks)} threads...")
+
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=num_workers
+                ) as executor:
+                    futures = [
+                        executor.submit(
+                            worker_crawl_chunk, chunk, cdp_url, auto_browser, producer
+                        )
+                        for chunk in chunks
+                    ]
+                    for future in concurrent.futures.as_completed(futures):
+                        jobs = future.result()
+                        all_jobs.extend(jobs)
+
+                log.info(f"Page 1 complete — total collected: {len(all_jobs)} jobs")
+
+        # Process remaining pages (2 .. max_pages)
+        for page_num in range(2, max_pages + 1):
+            list_url = f"{LIST_URL}?page={page_num}"
             log.info(f"\n[Page {page_num}/{max_pages}] {list_url}")
 
             if not load_page(page, list_url, wait_time=3.0):
-                log.error("Dừng — không load được trang danh sách")
+                log.error("Cannot load page — stopping")
                 break
 
             slugs = get_job_slugs(page)
             log.info(f"Found {len(slugs)} jobs")
 
             if not slugs:
-                log.warning("Không có jobs — selector có thể đã thay đổi")
+                log.warning("No jobs found — end of listings or selector changed")
                 break
 
-            for i, slug in enumerate(slugs, 1):
-                log.info(f"  [{i}/{len(slugs)}] {slug}")
-                job = extract_job_detail(page, slug)
-                if job:
-                    all_jobs.append(job)
-                    log.info(f"    ✓ {job['title']} @ {job['company']}")
+            original_len = len(slugs)
+            slugs = [slug for slug in slugs if f"itviec_{slug}" not in existing_job_ids]
+            if len(slugs) < original_len:
+                log.info(
+                    f"Skipped {original_len - len(slugs)} already crawled jobs. Remaining: {len(slugs)} jobs."
+                )
 
-                    # Push to Kafka immediately after extraction
-                    if producer:
-                        if producer.send_job(job):
-                            log.info(f"    📤 Sent to Kafka: '{job['title']}' ({job['source']})")
-                        else:
-                            log.warning(f"    ⚠ Failed to send to Kafka: '{job['title']}'")
+            if not slugs:
+                log.info(f"Page {page_num} complete — all jobs already exist.")
+                if page_num < max_pages:
+                    random_delay(PAGE_DELAY, PAGE_DELAY + 1.5)
+                continue
 
-                random_delay()
+            num_workers = min(4, len(slugs))
+            chunk_size = math.ceil(len(slugs) / num_workers)
+            chunks = [
+                slugs[i : i + chunk_size] for i in range(0, len(slugs), chunk_size)
+            ]
+            log.info(f"Processing concurrently using {len(chunks)} threads...")
 
-            log.info(f"Page {page_num} complete — total: {len(all_jobs)} jobs")
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=num_workers
+            ) as executor:
+                futures = [
+                    executor.submit(
+                        worker_crawl_chunk, chunk, cdp_url, auto_browser, producer
+                    )
+                    for chunk in chunks
+                ]
+                for future in concurrent.futures.as_completed(futures):
+                    jobs = future.result()
+                    all_jobs.extend(jobs)
+
+            log.info(
+                f"Page {page_num} complete — total collected: {len(all_jobs)} jobs"
+            )
 
             if page_num < max_pages:
                 random_delay(PAGE_DELAY, PAGE_DELAY + 1.5)
 
-        # KHÔNG gọi browser.close() — Chrome thật vẫn tiếp tục chạy
-        log.info("Crawler done — Chrome vẫn đang chạy bình thường")
+        # Close browser if we launched it (auto-browser mode)
+        if auto_browser:
+            browser.close()
+            log.info("Auto-browser: Chromium closed ✓")
+        else:
+            log.info("Crawler done — external Chrome still running")
 
     # Flush and close Kafka Producer
     if producer:
@@ -441,10 +697,13 @@ def crawl(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="ITviec Crawler — CDP connect to real Chrome"
+        description="ITviec Crawler — CDP or Auto-browser mode"
     )
     parser.add_argument(
-        "--pages", type=int, default=3, help="Số trang cần crawl (default: 3)"
+        "--pages",
+        type=int,
+        default=0,
+        help="Number of pages to crawl. 0 = auto-detect all pages (default: 0)",
     )
     parser.add_argument(
         "--output", type=str, default="itviec_jobs.json", help="Output JSON file"
@@ -464,6 +723,11 @@ if __name__ == "__main__":
         default="localhost:29092",
         help="Kafka bootstrap server (default: localhost:29092)",
     )
+    parser.add_argument(
+        "--auto-browser",
+        action="store_true",
+        help="Launch headless Chromium internally (no external Chrome needed)",
+    )
     args = parser.parse_args()
 
     crawl(
@@ -472,4 +736,5 @@ if __name__ == "__main__":
         cdp_url=args.cdp_url,
         kafka_enabled=not args.no_kafka,
         kafka_broker=args.kafka_broker,
+        auto_browser=args.auto_browser,
     )
