@@ -13,6 +13,8 @@
 
 A robust, end-to-end data pipeline to crawl, ingest, process, model, and visualize IT job market data in Vietnam. The project is fully containerized using Docker and orchestrated using Apache Airflow.
 
+⚠️ *The project is developed with the assistance of AI Agents* ⚠️
+
 ---
 
 ## 🏗️ Architecture & Workflow
@@ -122,3 +124,7 @@ Once the containers are running and healthy, you can access the following servic
 - `make logs-dashboard`: View Dashboard logs in real-time.
 - `make logs-consumer`: View Kafka Consumer logs in real-time.
 - `make clean`: Wipe out all containers and **ALL data volumes** (PostgreSQL, Kafka). Use with caution!
+
+---
+
+⚠️ *The project is still in development and may have some issues.* ⚠️
