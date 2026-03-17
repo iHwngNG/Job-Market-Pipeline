@@ -1,4 +1,4 @@
-# 🇻🇳 Vietnam Job Market Intelligence Pipeline
+<img width="1272" height="825" alt="jobmarketpipeline_preview" src="https://github.com/user-attachments/assets/a0d4f419-f007-4190-9a16-9ae54e59bc10" /># Vietnam Job Market Intelligence Pipeline
 
 ![Apache Airflow](https://img.shields.io/badge/Apache%20Airflow-017CEE?style=for-the-badge&logo=Apache%20Airflow&logoColor=white)
 ![Apache Kafka](https://img.shields.io/badge/Apache%20Kafka-231F20?style=for-the-badge&logo=apachekafka&logoColor=white)
@@ -8,6 +8,8 @@
 ![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B?style=for-the-badge&logo=Streamlit&logoColor=white)
 ![Playwright](https://img.shields.io/badge/Playwright-2EAD33?style=for-the-badge&logo=Playwright&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=Docker&logoColor=white)
+
+<img width="1272" height="825" alt="jobmarketpipeline_preview" src="https://github.com/user-attachments/assets/01e89b8c-6e26-46e0-b095-ce604b743773" />
 
 A robust, end-to-end data pipeline to crawl, ingest, process, model, and visualize IT job market data in Vietnam. The project is fully containerized using Docker and orchestrated using Apache Airflow.
 
